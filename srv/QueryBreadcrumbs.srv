@@ -1,0 +1,45 @@
+# QueryBreadcrumbs.srv
+#
+# Query the on-disk breadcrumb database.
+#
+# All filter fields are optional and stack (AND logic).
+# Set last_n=0 to return all rows (careful with large databases).
+#
+# Example: Get the 50 most-recent breadcrumbs where comms was lost
+#   last_n=50, filter_by_comms=true, has_comms_value=false
+
+# ── REQUEST ───────────────────────────────────────────────────────────────────
+
+# How many of the most-recent breadcrumbs to return.
+# 0 = return all rows (ordered oldest → newest).
+int32 last_n
+
+# If true, only return breadcrumbs matching has_comms_value.
+# If false, has_comms_value is ignored and all comms states are returned.
+bool filter_by_comms
+
+# Only used when filter_by_comms=true.
+# true  → return only breadcrumbs where comms was available (has_comms=1)
+# false → return only breadcrumbs where comms was NOT available (has_comms=0)
+# Note: breadcrumbs where comms was unknown (NULL) are always excluded when
+#       filter_by_comms=true.
+bool has_comms_value
+
+---
+
+# ── RESPONSE ──────────────────────────────────────────────────────────────────
+
+# True if the query executed successfully. False on DB error.
+bool success
+
+# Human-readable status or error description.
+string message
+
+# JSON array of matching breadcrumbs, ordered oldest → newest.
+# Each element matches the breadcrumb JSON published on the trail topic:
+#   [{"lat":...,"lon":...,"ts_sec":...,"has_comms":...,"metadata":{...}}, ...]
+# Empty array "[]" if no rows match.
+string json_result
+
+# Number of breadcrumbs in json_result.
+int32 count
