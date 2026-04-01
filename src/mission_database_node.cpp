@@ -93,6 +93,7 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
     const std::string gps_topic            = ns + "/sensors/ublox/fix";
     const std::string comms_topic          = ns + "/comms";
     const std::string compass_topic        = ns + "/compass";
+    const std::string gps_speed_topic      = ns + "/gps_speed";
     const std::string waypoint_event_topic = ns + "/mission_database/waypoint_event";
     const std::string trail_topic          = ns + "/mission_database/breadcrumb_trail";
     const std::string stats_topic          = ns + "/mission_database/stats";
@@ -115,9 +116,21 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
         std::bind(&MissionDatabaseNode::commsCallback, this, std::placeholders::_1));
 
     // Compass -- queue=1, only latest heading matters.
+    // QoS set to best_effort to match the compass node's publisher.
+    // The default RELIABLE subscription QoS is incompatible with a
+    // BEST_EFFORT publisher and causes a "no messages will be sent" warning.
+    rclcpp::QoS compass_qos(1);
+    compass_qos.reliable();
     compass_sub_ = create_subscription<std_msgs::msg::Float64>(
-        compass_topic, 1,
+        compass_topic, compass_qos,
         std::bind(&MissionDatabaseNode::compassCallback, this, std::placeholders::_1));
+
+    // GPS speed -- best_effort to match typical sensor publisher QoS.
+    rclcpp::QoS speed_qos(1);
+    speed_qos.best_effort();
+    gps_speed_sub_ = create_subscription<std_msgs::msg::Float64>(
+        gps_speed_topic, speed_qos,
+        std::bind(&MissionDatabaseNode::gpsSpeedCallback, this, std::placeholders::_1));
 
     waypoint_event_sub_ = create_subscription<msg::WaypointEvent>(
         waypoint_event_topic, 20,
@@ -199,11 +212,13 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
         "  GPS topic       : %s\n"
         "  Comms topic     : %s\n"
         "  Compass topic   : %s\n"
+        "  GPS speed topic : %s\n"
         "  Waypoint events : %s\n"
         "  Recovery nav    : %s\n"
         "  min_distance    : %.1f m  |  max_db_size: %.1f MB  |  debug: %s",
         robot_name_.c_str(), db_path_.c_str(), getRowCount(),
         gps_topic.c_str(), comms_topic.c_str(), compass_topic.c_str(),
+        gps_speed_topic.c_str(),
         waypoint_event_topic.c_str(), recovery_nav_topic.c_str(),
         min_distance_m_, max_db_size_mb, debug_enabled_ ? "true" : "false");
 
@@ -262,6 +277,7 @@ void MissionDatabaseNode::openDatabase()
         "  timestamp TEXT    NOT NULL,"
         "  has_comms INTEGER,"       // NULL=unknown, 0=no, 1=yes
         "  heading   REAL,"          // NULL=unknown, degrees 0-360 from compass
+        "  speed     REAL,"          // NULL=unknown, m/s from gps_speed
         "  metadata  TEXT    NOT NULL DEFAULT '{}'"
         ");");
 
@@ -283,11 +299,12 @@ void MissionDatabaseNode::openDatabase()
         "  waypoint_id                 INTEGER NOT NULL,"
         "  lat                         REAL    NOT NULL,"
         "  lon                         REAL    NOT NULL,"
-        "  heading                     REAL,"     // target heading from WaypointEvent
+        "  heading                     REAL,"
+        "  radius                      REAL    NOT NULL DEFAULT 2.0,"
         "  name                        TEXT    NOT NULL DEFAULT '',"
         "  dispatched_at               TEXT    NOT NULL,"
-        "  has_comms_at_dispatch       INTEGER,"  // NULL=unknown, 0=no, 1=yes
-        "  compass_heading_at_dispatch REAL,"     // NULL=unknown, degrees 0-360
+        "  has_comms_at_dispatch       INTEGER,"
+        "  compass_heading_at_dispatch REAL,"
         "  status                      TEXT    NOT NULL DEFAULT 'pending',"
         "  completed_at                TEXT"
         ");");
@@ -297,7 +314,13 @@ void MissionDatabaseNode::openDatabase()
         "ALTER TABLE breadcrumbs ADD COLUMN heading REAL;",
         nullptr, nullptr, nullptr);
     sqlite3_exec(db_,
+        "ALTER TABLE breadcrumbs ADD COLUMN speed REAL;",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
         "ALTER TABLE waypoints ADD COLUMN compass_heading_at_dispatch REAL;",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
+        "ALTER TABLE waypoints ADD COLUMN radius REAL NOT NULL DEFAULT 2.0;",
         nullptr, nullptr, nullptr);
     sqlite3_exec(db_,
         "ALTER TABLE home_position ADD COLUMN heading REAL;",
@@ -342,6 +365,7 @@ void MissionDatabaseNode::gpsCallback(
 
     std::optional<bool>   comms_snapshot;
     std::optional<double> heading_snapshot;
+    std::optional<double> speed_snapshot;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         ++stat_gps_received_;
@@ -356,6 +380,7 @@ void MissionDatabaseNode::gpsCallback(
 
         comms_snapshot   = current_has_comms_;
         heading_snapshot = current_heading_;
+        speed_snapshot   = current_speed_;
         last_lat_        = lat;
         last_lon_        = lon;
         ++stat_crumbs_recorded_;
@@ -373,7 +398,7 @@ void MissionDatabaseNode::gpsCallback(
         static_cast<int32_t>(stamp.seconds()),
         static_cast<uint32_t>(stamp.nanoseconds() % 1'000'000'000ULL));
 
-    insertBreadcrumb(lat, lon, ts, comms_snapshot, heading_snapshot, {});
+    insertBreadcrumb(lat, lon, ts, comms_snapshot, heading_snapshot, speed_snapshot, {});
     enforceStorageLimit();
     publishTrail();
     publishStats();
@@ -383,11 +408,14 @@ void MissionDatabaseNode::gpsCallback(
     }
 
     RCLCPP_INFO(get_logger(),
-        "[MissionDatabase] Breadcrumb: (%.9f, %.9f) comms=%s hdg=%s",
+        "[MissionDatabase] Breadcrumb: (%.9f, %.9f) comms=%s hdg=%s spd=%s",
         lat, lon,
         comms_snapshot.has_value() ? (comms_snapshot.value() ? "yes" : "no") : "?",
         heading_snapshot.has_value()
             ? (std::to_string(static_cast<int>(heading_snapshot.value())) + "deg").c_str()
+            : "?",
+        speed_snapshot.has_value()
+            ? (std::to_string(speed_snapshot.value()).substr(0, 5) + "m/s").c_str()
             : "?");
 }
 
@@ -417,30 +445,76 @@ void MissionDatabaseNode::commsCallback(
 
 //==============================================================================
 // COMPASS CALLBACK
+//
+// std_msgs/Float64 -- degrees 0-360 clockwise from north when calibrated,
+// -1.0 when uncalibrated.
+//
+// -1.0 and any non-finite value are treated as "not yet calibrated" and
+// current_heading_ is cleared to nullopt so breadcrumbs record NULL heading
+// rather than a meaningless value.  When a valid reading arrives after a
+// period of uncalibrated output, heading recording resumes automatically.
 //==============================================================================
 
 void MissionDatabaseNode::compassCallback(
     const std_msgs::msg::Float64::SharedPtr msg)
 {
-    // Guard against NaN/Inf from a misconfigured publisher -- storing either
-    // in SQLite as a REAL is implementation-defined and could corrupt queries.
-    if (!std::isfinite(msg->data)) {
+    const double raw = msg->data;
+
+    // -1.0 is the uncalibrated sentinel.  Also guard against any other
+    // non-finite value from a misconfigured publisher.
+    const bool uncalibrated = (raw < 0.0) || !std::isfinite(raw);
+
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    if (uncalibrated) {
+        if (current_heading_.has_value()) {
+            RCLCPP_INFO(get_logger(),
+                "[MissionDatabase] Compass uncalibrated (value: %.1f) -- "
+                "heading cleared, breadcrumbs will record NULL until calibrated.", raw);
+            current_heading_ = std::nullopt;
+        } else if (debug_enabled_) {
+            RCLCPP_DEBUG(get_logger(),
+                "[DEBUG][MissionDatabase] Compass still uncalibrated: %.1f", raw);
+        }
+        return;
+    }
+
+    // Normalise to [0, 360) -- handles any value outside that range
+    double heading = std::fmod(raw, 360.0);
+    if (heading < 0.0) heading += 360.0;
+
+    const bool was_calibrated = current_heading_.has_value();
+    current_heading_ = heading;
+
+    if (!was_calibrated) {
+        RCLCPP_INFO(get_logger(),
+            "[MissionDatabase] Compass calibrated -- first heading: %.1f deg", heading);
+    } else if (debug_enabled_) {
+        RCLCPP_DEBUG(get_logger(),
+            "[DEBUG][MissionDatabase] Compass: %.1f deg", heading);
+    }
+}
+
+//==============================================================================
+// GPS SPEED CALLBACK
+//==============================================================================
+
+void MissionDatabaseNode::gpsSpeedCallback(
+    const std_msgs::msg::Float64::SharedPtr msg)
+{
+    if (!std::isfinite(msg->data) || msg->data < 0.0) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-            "[MissionDatabase] Compass received non-finite value (%f) -- ignoring",
+            "[MissionDatabase] GPS speed invalid (%.3f m/s) -- ignoring",
             msg->data);
         return;
     }
 
-    // Normalise to [0, 360) in case the publisher sends values outside that range.
-    double heading = std::fmod(msg->data, 360.0);
-    if (heading < 0.0) heading += 360.0;
-
     std::lock_guard<std::mutex> lock(state_mutex_);
-    current_heading_ = heading;
+    current_speed_ = msg->data;
 
     if (debug_enabled_) {
         RCLCPP_DEBUG(get_logger(),
-            "[DEBUG][MissionDatabase] Compass: %.1f deg", heading);
+            "[DEBUG][MissionDatabase] GPS speed: %.2f m/s", msg->data);
     }
 }
 
@@ -472,8 +546,11 @@ void MissionDatabaseNode::waypointEventCallback(
             heading_snapshot = current_heading_;
         }
 
+        // Use radius from message, default to 2.0 if zero or negative
+        const double radius = (msg->radius > 0.0) ? msg->radius : 2.0;
+
         insertWaypoint(msg->waypoint_id, msg->lat, msg->lon,
-                       msg->heading, msg->name, now,
+                       msg->heading, radius, msg->name, now,
                        comms_snapshot, heading_snapshot);
 
         RCLCPP_INFO(get_logger(),
@@ -551,11 +628,12 @@ void MissionDatabaseNode::insertBreadcrumb(
     double lat, double lon, const std::string & timestamp,
     const std::optional<bool>   & has_comms,
     const std::optional<double> & heading,
+    const std::optional<double> & speed,
     const std::map<std::string, std::string> & metadata)
 {
     const char * sql =
-        "INSERT INTO breadcrumbs (lat, lon, timestamp, has_comms, heading, metadata) "
-        "VALUES (?, ?, ?, ?, ?, ?);";
+        "INSERT INTO breadcrumbs (lat, lon, timestamp, has_comms, heading, speed, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     SqliteStmt stmt(db_, sql);
     if (!stmt) {
@@ -580,6 +658,12 @@ void MissionDatabaseNode::insertBreadcrumb(
         sqlite3_bind_null(stmt.get(), 5);
     }
 
+    if (speed.has_value()) {
+        sqlite3_bind_double(stmt.get(), 6, *speed);
+    } else {
+        sqlite3_bind_null(stmt.get(), 6);
+    }
+
     // Metadata JSON
     std::ostringstream meta;
     meta << "{";
@@ -591,7 +675,7 @@ void MissionDatabaseNode::insertBreadcrumb(
     }
     meta << "}";
     const std::string meta_str = meta.str();
-    sqlite3_bind_text(stmt.get(), 6, meta_str.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, meta_str.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         RCLCPP_ERROR(get_logger(), "[MissionDatabase] INSERT failed: %s",
@@ -605,16 +689,17 @@ void MissionDatabaseNode::insertBreadcrumb(
 
 void MissionDatabaseNode::insertWaypoint(
     uint32_t waypoint_id, double lat, double lon,
-    double target_heading, const std::string & name,
+    double target_heading, double radius,
+    const std::string & name,
     const std::string & dispatched_at,
     const std::optional<bool>   & has_comms_at_dispatch,
     const std::optional<double> & compass_heading_at_dispatch)
 {
     const char * sql =
         "INSERT INTO waypoints "
-        "  (waypoint_id, lat, lon, heading, name, dispatched_at, "
+        "  (waypoint_id, lat, lon, heading, radius, name, dispatched_at, "
         "   has_comms_at_dispatch, compass_heading_at_dispatch, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending');";
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending');";
 
     SqliteStmt stmt(db_, sql);
     if (!stmt) {
@@ -627,26 +712,29 @@ void MissionDatabaseNode::insertWaypoint(
     sqlite3_bind_double(stmt.get(), 2, lat);
     sqlite3_bind_double(stmt.get(), 3, lon);
 
-    // target_heading: -1.0 from WaypointEvent means "no constraint"
+    // target_heading: -1.0 means "no constraint"
     if (target_heading >= 0.0) {
         sqlite3_bind_double(stmt.get(), 4, target_heading);
     } else {
         sqlite3_bind_null(stmt.get(), 4);
     }
 
-    sqlite3_bind_text(stmt.get(), 5, name.c_str(),         -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 6, dispatched_at.c_str(), -1, SQLITE_TRANSIENT);
+    // radius: clamp to minimum 0.1m to guard against zero/negative values
+    sqlite3_bind_double(stmt.get(), 5, std::max(0.1, radius));
+
+    sqlite3_bind_text(stmt.get(), 6, name.c_str(),         -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, dispatched_at.c_str(), -1, SQLITE_TRANSIENT);
 
     if (has_comms_at_dispatch.has_value()) {
-        sqlite3_bind_int(stmt.get(), 7, has_comms_at_dispatch.value() ? 1 : 0);
+        sqlite3_bind_int(stmt.get(), 8, has_comms_at_dispatch.value() ? 1 : 0);
     } else {
-        sqlite3_bind_null(stmt.get(), 7);
+        sqlite3_bind_null(stmt.get(), 8);
     }
 
     if (compass_heading_at_dispatch.has_value()) {
-        sqlite3_bind_double(stmt.get(), 8, *compass_heading_at_dispatch);
+        sqlite3_bind_double(stmt.get(), 9, *compass_heading_at_dispatch);
     } else {
-        sqlite3_bind_null(stmt.get(), 8);
+        sqlite3_bind_null(stmt.get(), 9);
     }
 
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
@@ -771,16 +859,16 @@ std::string MissionDatabaseNode::queryBreadcrumbsJson(
     std::string sql;
 
     if (limit <= 0) {
-        sql = "SELECT lat, lon, timestamp, has_comms, heading, metadata "
+        sql = "SELECT lat, lon, timestamp, has_comms, heading, speed, metadata "
               "FROM breadcrumbs";
         if (filter_comms) sql += comms_val ? " WHERE has_comms=1" : " WHERE has_comms=0";
         sql += " ORDER BY id ASC;";
     } else {
         std::string inner =
-            "SELECT lat, lon, timestamp, has_comms, heading, metadata FROM breadcrumbs";
+            "SELECT lat, lon, timestamp, has_comms, heading, speed, metadata FROM breadcrumbs";
         if (filter_comms) inner += comms_val ? " WHERE has_comms=1" : " WHERE has_comms=0";
         inner += " ORDER BY id DESC LIMIT " + std::to_string(limit);
-        sql = "SELECT lat, lon, timestamp, has_comms, heading, metadata "
+        sql = "SELECT lat, lon, timestamp, has_comms, heading, speed, metadata "
               "FROM (" + inner + ") ORDER BY rowid ASC;";
     }
 
@@ -806,17 +894,23 @@ std::string MissionDatabaseNode::queryBreadcrumbsJson(
         const bool hdg_null = (sqlite3_column_type(stmt.get(), 4) == SQLITE_NULL);
         const double hdg    = hdg_null ? 0.0 : sqlite3_column_double(stmt.get(), 4);
 
-        const char * meta = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt.get(), 5));
+        const bool spd_null = (sqlite3_column_type(stmt.get(), 5) == SQLITE_NULL);
+        const double spd    = spd_null ? 0.0 : sqlite3_column_double(stmt.get(), 5);
 
-        oss << "{\"lat\":"         << lat                  << ","
-            << "\"lon\":"          << lon                  << ","
-            << "\"timestamp\":\"" << (ts ? ts : "")        << "\","
+        const char * meta = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt.get(), 6));
+
+        oss << "{\"lat\":"          << lat                   << ","
+            << "\"lon\":"           << lon                   << ","
+            << "\"timestamp\":\""  << (ts ? ts : "")         << "\","
             << "\"has_comms\":";
         if (comms_null) oss << "null"; else oss << (comms_val2 ? "true" : "false");
         oss << ",\"heading\":";
         if (hdg_null) oss << "null"; else oss << hdg;
-        oss << ",\"metadata\":"    << (meta ? meta : "{}") << "}";
+        oss << ",\"speed\":";
+        if (spd_null) oss << "null"; else oss << std::fixed << std::setprecision(3) << spd;
+        oss << std::fixed << std::setprecision(9);  // restore precision for next row
+        oss << ",\"metadata\":"     << (meta ? meta : "{}") << "}";
 
         first = false;
     }
@@ -885,7 +979,7 @@ void MissionDatabaseNode::publishStats()
 void MissionDatabaseNode::publishWaypointList()
 {
     const char * sql =
-        "SELECT waypoint_id, lat, lon, heading, name, dispatched_at, "
+        "SELECT waypoint_id, lat, lon, heading, radius, name, dispatched_at, "
         "       has_comms_at_dispatch, compass_heading_at_dispatch, "
         "       status, completed_at "
         "FROM waypoints ORDER BY id ASC;";
@@ -917,18 +1011,19 @@ void MissionDatabaseNode::publishWaypointList()
             << "\"target_heading\":";
         if (col_null(3)) row << "null"; else row << sqlite3_column_double(stmt.get(), 3);
         row << ","
-            << "\"name\":\""                   << col_str(4) << "\","
-            << "\"dispatched_at\":\""          << col_str(5) << "\","
+            << "\"radius\":"                   << sqlite3_column_double(stmt.get(), 4) << ","
+            << "\"name\":\""                   << col_str(5) << "\","
+            << "\"dispatched_at\":\""          << col_str(6) << "\","
             << "\"has_comms_at_dispatch\":";
-        if (col_null(6)) row << "null";
-        else row << (sqlite3_column_int(stmt.get(), 6) ? "true" : "false");
+        if (col_null(7)) row << "null";
+        else row << (sqlite3_column_int(stmt.get(), 7) ? "true" : "false");
         row << ","
             << "\"compass_heading_at_dispatch\":";
-        if (col_null(7)) row << "null"; else row << sqlite3_column_double(stmt.get(), 7);
+        if (col_null(8)) row << "null"; else row << sqlite3_column_double(stmt.get(), 8);
         row << ","
-            << "\"status\":\""                 << col_str(8) << "\","
+            << "\"status\":\""                 << col_str(9) << "\","
             << "\"completed_at\":";
-        const std::string ca = col_str(9);
+        const std::string ca = col_str(10);
         if (ca.empty()) row << "null"; else row << "\"" << ca << "\"";
         row << "}";
 
@@ -1160,7 +1255,7 @@ void MissionDatabaseNode::publishRecoveryNavBundle()
     // ── RETURN WAYPOINTS (reached only, most-recent first) ────────────────────
     {
         SqliteStmt s(db_,
-            "SELECT waypoint_id, lat, lon, heading, name, completed_at, "
+            "SELECT waypoint_id, lat, lon, heading, radius, name, completed_at, "
             "       has_comms_at_dispatch, compass_heading_at_dispatch "
             "FROM waypoints WHERE status='reached' ORDER BY id DESC;");
 
@@ -1187,14 +1282,15 @@ void MissionDatabaseNode::publishRecoveryNavBundle()
                     << "\"target_heading\":";
                 if (col_null(3)) oss << "null"; else oss << sqlite3_column_double(s.get(), 3);
                 oss << ","
-                    << "\"name\":\""    << col_str(4) << "\","
-                    << "\"reached_at\":\"" << col_str(5) << "\","
+                    << "\"radius\":"                   << sqlite3_column_double(s.get(), 4) << ","
+                    << "\"name\":\""    << col_str(5) << "\","
+                    << "\"reached_at\":\"" << col_str(6) << "\","
                     << "\"had_comms\":";
-                if (col_null(6)) oss << "null";
-                else oss << (sqlite3_column_int(s.get(), 6) ? "true" : "false");
+                if (col_null(7)) oss << "null";
+                else oss << (sqlite3_column_int(s.get(), 7) ? "true" : "false");
                 oss << ","
                     << "\"compass_heading_at_dispatch\":";
-                if (col_null(7)) oss << "null"; else oss << sqlite3_column_double(s.get(), 7);
+                if (col_null(8)) oss << "null"; else oss << sqlite3_column_double(s.get(), 8);
                 oss << "}";
 
                 first = false;

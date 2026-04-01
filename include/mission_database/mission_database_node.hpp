@@ -16,6 +16,7 @@
 //     id INTEGER PK, lat REAL, lon REAL, timestamp TEXT,
 //     has_comms INTEGER,     -- NULL=unknown, 0=no, 1=yes
 //     heading REAL,          -- NULL=unknown, degrees 0-360 from compass
+//     speed REAL,            -- NULL=unknown, m/s from gps_speed topic
 //     metadata TEXT          -- JSON object for extensible fields
 //   )
 //   home_position (
@@ -26,6 +27,7 @@
 //     id INTEGER PK, waypoint_id INTEGER,
 //     lat REAL, lon REAL,
 //     heading REAL,                      -- target heading from WaypointEvent
+//     radius REAL NOT NULL DEFAULT 2.0,  -- acceptance radius in metres
 //     name TEXT,
 //     dispatched_at TEXT,
 //     has_comms_at_dispatch INTEGER,     -- NULL=unknown, 0=no, 1=yes
@@ -37,7 +39,7 @@
 // SUBSCRIPTIONS:
 //   /{robot_name}/sensors/ublox/fix        (sensor_msgs/NavSatFix)
 //   /{robot_name}/comms                    (west_point_comms_sim/msg/CommsStatus)
-//   /{robot_name}/compass                  (std_msgs/Float64, degrees 0-360)
+//   /{robot_name}/compass                  (std_msgs/Float64, degrees 0-360 when calibrated, -1.0 when not)
 //   /{robot_name}/mission_database/waypoint_event  (mission_database/WaypointEvent)
 //
 // PUBLICATIONS  (all transient_local / latched):
@@ -63,7 +65,8 @@
 //   debug                (bool,    default=false)
 //
 // ADAPTING THE COMPASS SUBSCRIPTION:
-//   When you create your compass node, publish std_msgs/Float64 (degrees 0-360)
+//   When you create your compass node, publish std_msgs/Float64 (degrees 0-360
+//   when calibrated, -1.0 when uncalibrated) on /{robot_name}/compass.
 //   on /{robot_name}/compass and it will wire up automatically.
 //   If you use a custom message type instead, change the template type in
 //   compass_sub_, compassCallback's parameter, and the msg->data access --
@@ -139,10 +142,18 @@ private:
     void commsCallback(
         const west_point_comms_sim::msg::CommsStatus::SharedPtr msg);
 
-    // Receives heading in degrees (0-360 CW from north) from std_msgs/Float64.
-    // If your compass node uses a custom type, change Float64 to that type
-    // here, in compass_sub_, and replace msg->data with your heading field.
+    // Receives heading from /{robot_name}/compass (std_msgs/Float64).
+    // Calibrated   : degrees 0-360 clockwise from north
+    // Uncalibrated : -1.0 (sentinel value)
+    // Values of -1.0 or any non-finite value are ignored -- current_heading_
+    // stays nullopt until a valid reading arrives.
     void compassCallback(const std_msgs::msg::Float64::SharedPtr msg);
+
+    // Receives robot ground speed in m/s from /{robot_name}/gps_speed
+    // (std_msgs/Float64). Snapshotted into every breadcrumb and used as the
+    // CoT <track speed="..."> value during TAK replay.
+    // Assumed BEST_EFFORT QoS -- change compass_qos to reliable() if needed.
+    void gpsSpeedCallback(const std_msgs::msg::Float64::SharedPtr msg);
 
     // Handles DISPATCHED / REACHED / FAILED events from BT nodes.
     void waypointEventCallback(const msg::WaypointEvent::SharedPtr msg);
@@ -166,6 +177,7 @@ private:
                           const std::string & timestamp,
                           const std::optional<bool>   & has_comms,
                           const std::optional<double> & heading,
+                          const std::optional<double> & speed,
                           const std::map<std::string, std::string> & metadata);
 
     void evictOldestRows(int64_t count);
@@ -176,6 +188,7 @@ private:
     void insertWaypoint(uint32_t waypoint_id,
                         double lat, double lon,
                         double target_heading,
+                        double radius,
                         const std::string & name,
                         const std::string & dispatched_at,
                         const std::optional<bool>   & has_comms_at_dispatch,
@@ -229,6 +242,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr            gps_sub_;
     rclcpp::Subscription<west_point_comms_sim::msg::CommsStatus>::SharedPtr comms_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr                 compass_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr                 gps_speed_sub_;
     rclcpp::Subscription<msg::WaypointEvent>::SharedPtr                     waypoint_event_sub_;
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr   trail_pub_;
@@ -264,6 +278,7 @@ private:
     std::optional<double> last_lon_;
     std::optional<bool>   current_has_comms_;
     std::optional<double> current_heading_;    // degrees 0-360, nullopt until first compass msg
+    std::optional<double> current_speed_;      // m/s, nullopt until first gps_speed msg
 
     // In-memory cache of the last-recorded comms position for O(1) publish.
     std::optional<double> last_comms_lat_;

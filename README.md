@@ -4,12 +4,12 @@ A ROS2 (Jazzy) package for the Warthog UGV simulation that maintains a persisten
 
 ## Features
 
-- **Breadcrumb trail** — GPS positions recorded every 8 metres, each annotated with comms status and compass heading
+- **Breadcrumb trail** — GPS positions recorded every 8 metres, each annotated with comms status, compass heading, and GPS speed
 - **Waypoint tracking** — BT nodes publish waypoint dispatch/completion events; the database tracks status and comms at each waypoint
 - **Home position** — manually configured per robot, persists across restarts
 - **Recovery navigation bundle** — a single topic containing home position, last known comms position, and confirmed-reached waypoints in reverse order; everything a BT behaviour needs to navigate back when comms drops
 - **SQLite on disk** — near-zero RAM footprint; data survives node crashes; queryable with any SQLite tool
-- **TAK replay** — standalone script replays a mission database to a TAK server with correct timing, pause/resume controls, and optional cleanup
+- **TAK replay** — standalone script replays a mission database to ATAK with correct timing, comms-aware colouring, pause/resume controls, and optional cleanup
 
 ---
 
@@ -42,7 +42,7 @@ mission_database/
 |---|---|
 | `rclcpp` | ROS2 C++ client library |
 | `sensor_msgs` | `NavSatFix` for GPS |
-| `std_msgs` | `String` (JSON topics), `Float64` (compass) |
+| `std_msgs` | `String` (JSON topics and compass) |
 | `west_point_comms_sim` | `CommsStatus` message type |
 | `libsqlite3-dev` | System library — `sudo apt install libsqlite3-dev` |
 
@@ -115,7 +115,7 @@ ros2 param set /warthog1/mission_database_node home_heading 140.0
 |---|---|---|
 | `/{robot}/sensors/ublox/fix` | `sensor_msgs/NavSatFix` | GPS position |
 | `/{robot}/comms` | `west_point_comms_sim/CommsStatus` | Mesh radio connectivity |
-| `/{robot}/compass` | `std_msgs/Float64` | Heading in degrees 0–360 |
+| `/{robot}/compass` | `std_msgs/String` | Heading in degrees 0–360 when calibrated |
 | `/{robot}/mission_database/waypoint_event` | `mission_database/WaypointEvent` | BT waypoint dispatch/completion |
 
 ### Publications (all `transient_local` / latched)
@@ -139,24 +139,47 @@ ros2 param set /warthog1/mission_database_node home_heading 140.0
 
 ## WaypointEvent Message
 
-BT nodes publish to `/{robot}/mission_database/waypoint_event` to record navigation objectives:
+BT nodes publish to `/{robot}/mission_database/waypoint_event` to record navigation objectives.
+
+### Message fields
+
+| Field | Type | Description |
+|---|---|---|
+| `header` | `std_msgs/Header` | Standard ROS header (stamp, frame_id) |
+| `event_type` | `uint8` | `DISPATCHED=0`, `REACHED=1`, `FAILED=2` |
+| `waypoint_id` | `uint32` | Unique ID within the mission session — must match between DISPATCHED and the subsequent REACHED/FAILED |
+| `lat` | `float64` | Target latitude (required for DISPATCHED; ignored for REACHED/FAILED) |
+| `lon` | `float64` | Target longitude (required for DISPATCHED; ignored for REACHED/FAILED) |
+| `heading` | `float64` | Desired heading at the waypoint in degrees 0–360. Set to `-1.0` if heading is unconstrained |
+| `radius` | `float64` | Acceptance radius in metres — robot is considered arrived when within this distance. Default `2.0` m |
+| `name` | `string` | Optional human-readable label (e.g. `"alpha"`, `"checkpoint_3"`) |
+
+### Example usage
 
 ```cpp
 // When sending a waypoint to navigation:
 auto evt        = mission_database::msg::WaypointEvent{};
+evt.header.stamp = this->now();
 evt.event_type  = WaypointEvent::DISPATCHED;
 evt.waypoint_id = objective_id;   // unique ID for correlation
 evt.lat         = target_lat;
 evt.lon         = target_lon;
-evt.heading     = target_heading; // degrees, or -1.0 if unconstrained
+evt.heading     = target_heading; // degrees 0-360, or -1.0 if unconstrained
+evt.radius      = 2.0;            // metres
 evt.name        = "checkpoint_alpha";
 waypoint_event_pub_->publish(evt);
 
-// On arrival:
-evt.event_type  = WaypointEvent::REACHED;  // or FAILED
-evt.waypoint_id = objective_id;            // same ID as DISPATCHED
-waypoint_event_pub_->publish(evt);
+// On arrival or failure:
+auto done_evt        = mission_database::msg::WaypointEvent{};
+done_evt.header.stamp = this->now();
+done_evt.event_type  = WaypointEvent::REACHED;  // or FAILED
+done_evt.waypoint_id = objective_id;            // same ID as DISPATCHED
+waypoint_event_pub_->publish(done_evt);
 ```
+
+### Retry behaviour
+
+If a waypoint fails and is retried with the same `waypoint_id`, the database updates the most recent pending row rather than creating a duplicate. This means a failed-then-retried waypoint that eventually succeeds will show a single `reached` entry in the database.
 
 ---
 
@@ -220,7 +243,7 @@ You can query any database file directly while the node is running (SQLite suppo
 ```bash
 # Last 10 breadcrumbs
 sqlite3 /phoenix/src/utils/mission_database/database/warthog1_2024-03-15_14-23-07.db \
-  "SELECT timestamp, lat, lon, has_comms, heading FROM breadcrumbs ORDER BY id DESC LIMIT 10;"
+  "SELECT timestamp, lat, lon, has_comms, heading, speed FROM breadcrumbs ORDER BY id DESC LIMIT 10;"
 
 # All waypoints and status
 sqlite3 /phoenix/src/utils/mission_database/database/warthog1_2024-03-15_14-23-07.db \
@@ -235,7 +258,44 @@ sqlite3 /phoenix/src/utils/mission_database/database/warthog1_2024-03-15_14-23-0
 
 ## TAK Replay
 
-Replay a database file to TAK to visualise the robot's trajectory on ATAK:
+Replays a database file to ATAK by publishing CoT messages on `/{robot}/send_to_tak`. All events — breadcrumbs, waypoint dispatches, and waypoint completions — are replayed in a single unified timeline with correct inter-event timing.
+
+### Comms-aware colouring
+
+Breadcrumb spot markers are coloured based on the `has_comms` value recorded at that timestamp:
+
+| Comms state | ATAK spot colour | Terminal label |
+|---|---|---|
+| `has_comms = 1` (link up) | White | `comms=OK` |
+| `has_comms = 0` (link lost) | Red | `comms=LOST` |
+| `has_comms = NULL` (unknown) | White | `comms=?` |
+
+If the database has no `has_comms` data the comms column is omitted from the terminal output entirely.
+
+### Waypoint events
+
+Waypoint dispatch and completion events appear as numbered entries in the event stream rather than as side-effects of breadcrumb processing. The total event count includes breadcrumbs and waypoint updates:
+
+```
+Starting replay -- 17 breadcrumb(s), 2 waypoint event(s).  (comms status loaded)
+
+[PLAYING] [   1/19]  2026-04-01 22:19:49 UTC  (39.35163, -76.34435)  hdg=n/a  spd=0.00m/s*  comms=OK
+  Next in 17.8s (real gap: 17.8s  speed: 1.0x)  [Space/p = pause  q = quit]
+[PLAYING] [   2/19]  2026-04-01 22:20:07 UTC  -> WP0 dispatched (yellow)
+  Next in 10.7s (real gap: 10.7s  speed: 1.0x)  [Space/p = pause  q = quit]
+...
+[PLAYING] [  18/19]  2026-04-01 22:21:29 UTC  (39.35257, -76.34520)  hdg=324.1deg  spd=1.64m/s  comms=OK
+  Next in 2.8s (real gap: 2.8s  speed: 1.0x)  [Space/p = pause  q = quit]
+[PLAYING] [  19/19]  2026-04-01 22:21:32 UTC  -> WP0 reached (green)
+
+Replay complete.  17 breadcrumb(s), 2 waypoint event(s) sent.
+```
+
+Waypoint completion events whose `completed_at` timestamp falls after the last breadcrumb (common when the robot reaches a waypoint near the end of recording) are appended at the correct timestamp and fire after a real timed gap — they are not a silent post-loop flush.
+
+A `*` suffix on speed (e.g. `spd=0.00m/s*`) means GPS speed was not yet available when that breadcrumb was recorded; `0.0` is used as a fallback.
+
+### Running
 
 ```bash
 # Real-time replay
@@ -255,7 +315,7 @@ ros2 run mission_database db_tak_replay.py \
 
 **Terminal controls** (timed mode): `Space`/`p` = pause/resume, `q` = quit
 
-After replay completes you will be prompted whether to send delete CoT commands to remove the symbols from ATAK.
+After replay completes you will be prompted whether to send delete CoT commands to remove all symbols (breadcrumbs, home marker, waypoint circles) from ATAK.
 
 ### Replay arguments
 
@@ -264,15 +324,15 @@ After replay completes you will be prompted whether to send delete CoT commands 
 | `db_path` | required | Path to `.db` file |
 | `--robot_name` | inferred from filename | Robot namespace |
 | `--speed` | `1.0` | Playback speed multiplier |
-| `--instant` | off | Send all breadcrumbs immediately |
-| `--track_speed` | `1.4` | CoT `<track speed>` in m/s |
+| `--instant` | off | Send all events immediately with no timing delays |
+| `--track_speed` | `0.0` | Fallback CoT `<track speed>` in m/s for breadcrumbs with no recorded GPS speed |
 | `--skip_home` | off | Skip the home position CoT marker |
 
 ---
 
 ## Compass Topic
 
-The node subscribes to `/{robot}/compass` (`std_msgs/Float64`, degrees 0–360 clockwise from north). If your compass node publishes a custom message type, change `std_msgs::msg::Float64` to your type in `mission_database_node.hpp` and `mission_database_node.cpp` — the comment `ADAPTING TO A CUSTOM MESSAGE TYPE` marks the exact lines.
+The node subscribes to `/{robot}/compass` (`std_msgs/String`). When calibrated, publish a numeric string e.g. `"142.5"` (degrees 0–360, clockwise from north). Non-numeric values like `"uncalibrated"` are ignored gracefully — `current_heading_` stays `nullopt` and breadcrumbs record `NULL` for heading until a valid reading arrives. When calibration is regained, heading recording resumes automatically.
 
 ---
 
@@ -285,7 +345,8 @@ CREATE TABLE breadcrumbs (
     lon       REAL    NOT NULL,
     timestamp TEXT    NOT NULL,   -- "2024-03-15 14:23:07.042 UTC"
     has_comms INTEGER,            -- NULL=unknown, 0=no, 1=yes
-    heading   REAL,               -- NULL=unknown, degrees 0-360
+    heading   REAL,               -- NULL=unknown, degrees 0-360 from compass
+    speed     REAL,               -- NULL=unknown, m/s from GPS speed topic
     metadata  TEXT    NOT NULL DEFAULT '{}'
 );
 
@@ -303,6 +364,7 @@ CREATE TABLE waypoints (
     waypoint_id                 INTEGER NOT NULL,
     lat                         REAL    NOT NULL,
     lon                         REAL    NOT NULL,
+    radius                      REAL    NOT NULL DEFAULT 2.0,  -- arrival radius in metres
     heading                     REAL,   -- target heading from WaypointEvent
     name                        TEXT    NOT NULL DEFAULT '',
     dispatched_at               TEXT    NOT NULL,

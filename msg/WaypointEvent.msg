@@ -44,13 +44,18 @@ std_msgs/Header header
 uint8 event_type
 
 # GPS coordinates of the waypoint target.
-# Required for DISPATCHED.  Ignored for REACHED/FAILED (looked up by waypoint_id).
+# Required for DISPATCHED.  Ignored for REACHED/FAILED (looked up by waypt_num).
 float64 lat
 float64 lon
 
 # Desired heading at the waypoint in degrees clockwise from north (0–360).
 # Set to -1.0 if heading is not constrained for this waypoint.
 float64 heading
+
+# Acceptance radius around the waypoint in metres.
+# The robot is considered to have reached the waypoint when it comes within
+# this distance.  Default 2.0 m if not specified.
+float64 radius
 
 # Optional human-readable label (e.g. "alpha", "checkpoint_3", "extract_point").
 # Used in the database and published JSON for human readability.
