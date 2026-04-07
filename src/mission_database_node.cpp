@@ -90,7 +90,7 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
     //--------------------------------------------------------------------------
 
     const std::string ns                   = "/" + robot_name_;
-    const std::string gps_topic            = ns + "/sensors/ublox/fix";
+    const std::string gps_topic            = ns + "/sensors/geofog/gps/fix";
     const std::string comms_topic          = ns + "/comms";
     const std::string compass_topic        = ns + "/compass";
     const std::string gps_speed_topic      = ns + "/gps_speed";
