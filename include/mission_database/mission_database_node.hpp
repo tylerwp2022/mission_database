@@ -37,7 +37,9 @@
 //   )
 //
 // SUBSCRIPTIONS:
-//   /{robot_name}/sensors/ublox/fix        (sensor_msgs/NavSatFix)
+//   /{robot_name}/{gps_topic_suffix}               (sensor_msgs/NavSatFix)
+//       Active GPS topic. Suffix selected per-profile (geofog or ublox).
+//       Default: "sensors/geofog/gps/fix". See gps_topic_suffix parameter.
 //   /{robot_name}/comms                    (west_point_comms_sim/msg/CommsStatus)
 //   /{robot_name}/compass                  (std_msgs/Float64, degrees 0-360 when calibrated, -1.0 when not)
 //   /{robot_name}/mission_database/waypoint_event  (mission_database/WaypointEvent)
@@ -55,6 +57,12 @@
 //
 // ROS2 PARAMETERS:
 //   robot_name           (string,  required)
+//   gps_topic_suffix     (string,  default="sensors/geofog/gps/fix")
+//                          GPS topic path after /{robot_name}/. Set to
+//                          "sensors/geofog/gps/fix" for GeoFog (NAI_2, testing)
+//                          or "sensors/ublox/fix" for u-blox (NAI_3, NAI_4).
+//                          Driven by gps_topic_suffix in the active profile
+//                          (petaar26/experiment/profiles.json).
 //   db_path              (string,  default="/tmp/{robot_name}_mission_database.db")
 //   home_lat             (double,  default=NaN -- unset)
 //   home_lon             (double,  default=NaN -- unset)
@@ -235,6 +243,26 @@ private:
 
     static bool hasBaseInTransitive(const std::vector<std::string> & transitive);
 
+    // ROS2 Jazzy compatibility: parameters delivered via --params-file are
+    // pre-declared by the rcl layer before the node constructor runs.  A
+    // subsequent declare_parameter() call on an already-declared parameter
+    // throws ParameterAlreadyDeclaredException and kills the node.
+    //
+    // getOrDeclare() checks has_parameter() first.  If the parameter is
+    // already declared (pre-loaded from the launch params file), it returns
+    // the existing value directly.  If it is not yet declared (parameter was
+    // not supplied by the launch system), it declares it with default_val so
+    // that it appears in ros2 param list and can be updated at runtime via
+    // ros2 param set.  Either path leaves the parameter correctly registered.
+    template<typename T>
+    T getOrDeclare(const std::string & name, const T & default_val)
+    {
+        if (!has_parameter(name)) {
+            declare_parameter<T>(name, default_val);
+        }
+        return get_parameter(name).get_value<T>();
+    }
+
     //==========================================================================
     // ROS2 INTERFACES
     //==========================================================================
@@ -289,7 +317,11 @@ private:
     //==========================================================================
 
     std::string robot_name_;
-    double      min_distance_m_;
+    // Safe default: 8.0 m matches the declare_parameter() default.
+    // If declare_parameter() were somehow delayed and a GPS callback fired
+    // first, an uninitialized double here would silently disable the filter
+    // (0.0 causes dist < 0.0 to always be false -- every fix gets recorded).
+    double      min_distance_m_   = 8.0;
     size_t      max_db_size_bytes_;
     int32_t     publish_window_size_;
     bool        debug_enabled_;

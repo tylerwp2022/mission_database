@@ -53,7 +53,7 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
     // PARAMETERS
     //--------------------------------------------------------------------------
 
-    robot_name_ = declare_parameter<std::string>("robot_name", "");
+    robot_name_ = getOrDeclare<std::string>("robot_name", std::string{""});
     if (robot_name_.empty()) {
         RCLCPP_FATAL(get_logger(),
             "[MissionDatabase] 'robot_name' parameter is required.");
@@ -61,23 +61,38 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
     }
 
     const std::string default_db = "/tmp/" + robot_name_ + "_mission_database.db";
-    db_path_ = declare_parameter<std::string>("db_path", default_db);
+    db_path_ = getOrDeclare<std::string>("db_path", default_db);
 
-    min_distance_m_ = declare_parameter<double>("min_distance_m", 8.0);
+    min_distance_m_ = getOrDeclare<double>("min_distance_m", 8.0);
 
-    const double max_db_size_mb = declare_parameter<double>("max_db_size_mb", 10.0);
+    const double max_db_size_mb = getOrDeclare<double>("max_db_size_mb", 10.0);
     max_db_size_bytes_ = static_cast<size_t>(max_db_size_mb * 1024.0 * 1024.0);
 
-    publish_window_size_ = declare_parameter<int>("publish_window_size", 100);
+    publish_window_size_ = getOrDeclare<int>("publish_window_size", 100);
     if (publish_window_size_ <= 0) publish_window_size_ = 100;
 
-    const double publish_rate_hz = declare_parameter<double>("publish_rate_hz", 1.0);
-    debug_enabled_ = declare_parameter<bool>("debug", false);
+    const double publish_rate_hz = getOrDeclare<double>("publish_rate_hz", 1.0);
+    debug_enabled_ = getOrDeclare<bool>("debug", false);
+
+    // GPS topic suffix — selects the active GPS hardware variant.
+    // WHY PARAMETERISED:
+    //   The PETAAR study deploys two GPS hardware variants across conditions:
+    //     - GeoFog GNSS  → "sensors/geofog/gps/fix"  (NAI_2, testing profiles)
+    //     - u-blox GNSS  → "sensors/ublox/fix"        (NAI_3, NAI_4 profiles)
+    //   The active suffix is selected per-profile in petaar26/experiment/profiles.json
+    //   and passed here by mission_database.launch.py. Without this parameter the
+    //   node would subscribe to the wrong GPS topic on NAI_3/NAI_4 and record no
+    //   breadcrumbs for the entire mission.
+    //
+    //   Defaults to the historical hardcoded string so existing launch
+    //   configurations that do not pass this parameter continue to work.
+    const std::string gps_topic_suffix =
+        getOrDeclare<std::string>("gps_topic_suffix", "sensors/geofog/gps/fix");
 
     // Home position -- NaN sentinel means "not set via parameter".
-    declare_parameter<double>("home_lat", std::numeric_limits<double>::quiet_NaN());
-    declare_parameter<double>("home_lon", std::numeric_limits<double>::quiet_NaN());
-    declare_parameter<double>("home_heading", std::numeric_limits<double>::quiet_NaN());
+    getOrDeclare<double>("home_lat",     std::numeric_limits<double>::quiet_NaN());
+    getOrDeclare<double>("home_lon",     std::numeric_limits<double>::quiet_NaN());
+    getOrDeclare<double>("home_heading", std::numeric_limits<double>::quiet_NaN());
 
     //--------------------------------------------------------------------------
     // OPEN DATABASE
@@ -90,7 +105,7 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
     //--------------------------------------------------------------------------
 
     const std::string ns                   = "/" + robot_name_;
-    const std::string gps_topic            = ns + "/sensors/geofog/gps/fix";
+    const std::string gps_topic            = ns + "/" + gps_topic_suffix;
     const std::string comms_topic          = ns + "/comms";
     const std::string compass_topic        = ns + "/compass";
     const std::string gps_speed_topic      = ns + "/gps_speed";
