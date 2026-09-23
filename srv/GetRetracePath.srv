@@ -1,0 +1,69 @@
+# GetRetracePath.srv
+#
+# "I'm here -- give me the way back."
+#
+# Returns the path the robot drove, newest -> oldest, as plain lat/lon arrays
+# a BT node can consume directly (no JSON parsing). Out-and-back excursions
+# (a previous retrace, then driving forward again) are removed, so the robot
+# is never sent forward toward an old loss point before turning around.
+#
+# The result is a pure function of (breadcrumbs on disk, from position), so
+# it gives the same answer before and after a BT crash/restart.
+#
+# Service name: /{robot}/mission_database/retrace_path
+#
+# Examples:
+#   All the way home from the robot's position:
+#     from_lat=39.3526, from_lon=-76.3452, max_path_m=0, min_spacing_m=0
+#   Back out ~30 m along the trail, then stop:
+#     from_lat=..., from_lon=..., max_path_m=30, min_spacing_m=0
+
+# ── REQUEST ───────────────────────────────────────────────────────────────────
+
+# Robot's current position (degrees). Used to pick where on the trail to start
+# and to measure path length. If non-finite, or both exactly 0.0 ("unset"),
+# the newest point on the trail is used instead.
+float64 from_lat
+float64 from_lon
+
+# Path budget in metres, measured from the robot along the returned path.
+#   <= 0 : the whole trail, with the home position appended at the end.
+#   >  0 : stop at the first point where path length >= max_path_m.
+#          Home is NOT appended in this mode (you asked for "back out N m",
+#          not "go home").
+float64 max_path_m
+
+# Thin the returned points so consecutive points are at least this far apart
+# along the path. The last point is always kept.
+#   <= 0 : return every breadcrumb on the path (full fidelity; default).
+# WHY: each point costs a full send-mission/START/monitor cycle on the robot.
+# Larger spacing = fewer stops, but straighter lines between points (more
+# corner cutting). Leave at 0 near buildings.
+float64 min_spacing_m
+
+---
+# ── RESPONSE ──────────────────────────────────────────────────────────────────
+
+# True if the query ran. An empty path is still success=true (see message).
+# False only on a DB error.
+bool success
+
+# Human-readable status, e.g. "OK: 14 points, 112.3 m, ends at home".
+string message
+
+# The path, in driving order: lats[0]/lons[0] is the first point to drive to.
+# Always the same length as each other.
+float64[] lats
+float64[] lons
+
+# Length of the returned path in metres: robot -> point 0 -> ... -> last point.
+float64 path_length_m
+
+# True if the last point is the home position (only when max_path_m <= 0 and
+# a home position is stored).
+bool ends_at_home
+
+# Diagnostics: breadcrumbs read from the DB, and how many of them were dropped
+# as out-and-back excursions.
+int32 crumbs_total
+int32 crumbs_erased

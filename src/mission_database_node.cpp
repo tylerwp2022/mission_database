@@ -73,6 +73,12 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
 
     const double publish_rate_hz = getOrDeclare<double>("publish_rate_hz", 1.0);
     debug_enabled_ = getOrDeclare<bool>("debug", false);
+    
+    // Retrace path tunables (see src/retrace_service.cpp for what they do).
+    // Defaults scale with the crumb spacing so changing min_distance_m keeps
+    // them sane. Read again on every service call, so `ros2 param set` works live.
+    getOrDeclare<double>("retrace_closure_radius_m", 0.9 * min_distance_m_);
+    getOrDeclare<double>("retrace_anchor_radius_m",  1.5 * min_distance_m_);
 
     // GPS topic suffix — selects the active GPS hardware variant.
     // WHY PARAMETERISED:
@@ -207,6 +213,13 @@ MissionDatabaseNode::MissionDatabaseNode(const rclcpp::NodeOptions & options)
         query_svc,
         std::bind(&MissionDatabaseNode::queryServiceCallback, this,
                   std::placeholders::_1, std::placeholders::_2));
+                  
+    const std::string retrace_svc = ns + "/mission_database/retrace_path";
+    retrace_service_ = create_service<srv::GetRetracePath>(
+        retrace_svc,
+        std::bind(&MissionDatabaseNode::retracePathCallback, this,
+            std::placeholders::_1, std::placeholders::_2));
+    RCLCPP_INFO(get_logger(), "[MissionDatabase] Retrace service: %s", retrace_svc.c_str());
 
     //--------------------------------------------------------------------------
     // PUBLISH TIMER

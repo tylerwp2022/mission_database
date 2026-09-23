@@ -27,6 +27,7 @@ find_package(SQLite3                  REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/QueryBreadcrumbs.srv"
+  "srv/GetRetracePath.srv"
   "msg/WaypointEvent.msg"
   DEPENDENCIES std_msgs
 )
@@ -39,6 +40,7 @@ ament_export_dependencies(rosidl_default_runtime)
 
 add_executable(mission_database_node
   src/mission_database_node.cpp
+  src/retrace_service.cpp
 )
 
 target_include_directories(mission_database_node PUBLIC

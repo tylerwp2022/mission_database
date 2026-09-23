@@ -95,6 +95,7 @@
 
 #include "mission_database/msg/waypoint_event.hpp"
 #include "mission_database/srv/query_breadcrumbs.hpp"
+#include "mission_database/srv/get_retrace_path.hpp"
 
 #include <sqlite3.h>
 
@@ -171,6 +172,13 @@ private:
     void queryServiceCallback(
         const std::shared_ptr<srv::QueryBreadcrumbs::Request>  request,
               std::shared_ptr<srv::QueryBreadcrumbs::Response> response) const;
+    
+    // Handler for /{robot}/mission_database/retrace_path.
+    // Defined in src/retrace_service.cpp; path logic in retrace_path.hpp.
+    // Read-only and const, like queryServiceCallback.
+    void retracePathCallback(
+        const std::shared_ptr<srv::GetRetracePath::Request> request,
+        std::shared_ptr<srv::GetRetracePath::Response> response) const;
 
     //==========================================================================
     // DATABASE
@@ -281,6 +289,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr   recovery_nav_pub_;
 
     rclcpp::Service<srv::QueryBreadcrumbs>::SharedPtr     query_service_;
+    rclcpp::Service<srv::GetRetracePath>::SharedPtr retrace_service_;
     rclcpp::TimerBase::SharedPtr                          publish_timer_;
 
     // Kept alive so the parameter-change callback remains registered.
